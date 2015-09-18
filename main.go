@@ -33,9 +33,11 @@ func main() {
 			if info.IsDir() {
 				return nil
 			}
+			if info.Size() < 1024*1024 {
+				return nil
+			}
 			c_all++
 			key := info.Name() + "." + fmt.Sprintf("%d", info.Size())
-			//fmt.Println(path + "\t" + key)
 			v := index[key]
 			if len(v) > 0 {
 				c_pot++
@@ -54,9 +56,9 @@ func main() {
 
 	for k, v := range index {
 		done++
-		d := int(float32(done) / float32(total))
+		d := int(float32(done) / float32(total) * 100.0)
 		if d != last {
-			fmt.Printf("%d% done (%d / %d)\n", d, done, total)
+			fmt.Printf("%d%% done (%d / %d)\n", d, done, total)
 			last = d
 		}
 
@@ -67,9 +69,11 @@ func main() {
 			continue
 		}
 
+		//args := []string{"-ahl"}
 		args := []string{"-d"}
 		args = append(args, v...)
 
+		//cmd := exec.Command("ls", args...)
 		cmd := exec.Command("duperemove", args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stdout
