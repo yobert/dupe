@@ -2,13 +2,18 @@ package main
 
 import (
 	"crypto/md5"
-	"crypto/sha512"
+	//"crypto/sha512"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"flag"
+	"time"
+	"bytes"
 )
 
 type File struct {
@@ -19,12 +24,20 @@ type File struct {
 }
 
 const (
-	q1_workers = 1
-	q2_workers = 1
+	q1_workers = 2
+	q2_workers = 4
 	q3_workers = 1
+	q1_c = 1000000
+	q2_c = 100000
+	q3_c = 10000
+	size_max = 1024*1024*100
 )
 
 var (
+	dry bool
+	sanity bool
+	verbose bool
+
 	wg1 sync.WaitGroup
 	wg2 sync.WaitGroup
 	wg3 sync.WaitGroup
@@ -42,18 +55,72 @@ var (
 	q3_idx map[string]File
 
 	q4_mu sync.Mutex
+
+	stat_start time.Time
+	stat_files int64
+	stat_files_done int64
+	stat_files_saved int64
+	stat_bytes int64
+	stat_bytes_done int64
+	stat_bytes_saved int64
 )
 
 func main() {
+	flag.BoolVar(&dry, "dry", false, "Dry run")
+	flag.BoolVar(&sanity, "sanity", false, "Sanity check (slower)")
+	flag.BoolVar(&verbose, "v", false, "Print files as we go")
+	flag.Parse()
 
-	q1 = make(chan File)
+	if dry {
+		fmt.Println("dry running...")
+	} else {
+		fmt.Println("running...")
+	}
+	if sanity {
+		fmt.Println("sanity checks enabled")
+	}
+
+	stat_start = time.Now()
+
+	go func() {
+		spaces := ""
+		dels := ""
+		for i := 0; i < 1024; i++ {
+			spaces = spaces + " "
+			dels = dels + "\b"
+		}
+		last := ""
+		for {
+			time.Sleep(time.Millisecond * 10)
+			stats := fmt.Sprintf("   %d/%d %s/%s %d/%s",
+				stat_files_done, stat_files,
+				fmt_size(stat_bytes_done),
+				fmt_size(stat_bytes),
+				stat_files_saved,
+				fmt_size(stat_bytes_saved),
+			)
+			if stats == last {
+				continue
+			}
+
+			fmt.Print(spaces[:len(last)])
+			fmt.Print(dels[:len(last)])
+
+			fmt.Print(stats)
+			fmt.Print(dels[:len(stats)])
+
+			last = stats
+		}
+	}()
+
+	q1 = make(chan File, q1_c)
 	q1_idx = make(map[int]File)
 	q1_dups = make(map[string]struct{})
 
-	q2 = make(chan File)
+	q2 = make(chan File, q2_c)
 	q2_idx = make(map[string]File)
 
-	q3 = make(chan File)
+	q3 = make(chan File, q3_c)
 	q3_idx = make(map[string]File)
 
 	for i := 0; i < q1_workers; i++ {
@@ -71,7 +138,9 @@ func main() {
 		go q3_worker()
 	}
 
-	for _, p := range os.Args[1:] {
+	for _, p := range flag.Args() {
+		fmt.Println("folder: " + p)
+
 		err := Walk(p, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -79,7 +148,7 @@ func main() {
 
 			s := int(info.Size())
 
-			if s < 1024*1024 {
+			if s < size_max {
 				return nil
 			}
 			if info.Mode()&os.ModeSymlink > 0 {
@@ -111,7 +180,9 @@ func main() {
 					q1 <- first
 					first.sent = true
 					q1_idx[s] = first
+					atomic.AddInt64(&stat_files, 1)
 				}
+				atomic.AddInt64(&stat_files, 1)
 				q1 <- f
 			} else {
 				q1_idx[s] = f
@@ -154,6 +225,7 @@ func q1_worker() {
 		f.sent = false
 
 		err := func() error {
+			defer atomic.AddInt64(&stat_files_done, 1)
 			h := md5.New()
 			fh, err := os.Open(f.path)
 			if err != nil {
@@ -180,8 +252,10 @@ func q1_worker() {
 					q2 <- first
 					first.sent = true
 					q2_idx[s] = first
+					atomic.AddInt64(&stat_bytes, int64(first.size))
 				}
 				q2 <- f
+				atomic.AddInt64(&stat_bytes, int64(f.size))
 			} else {
 				q2_idx[s] = f
 			}
@@ -196,8 +270,6 @@ func q1_worker() {
 
 func q2_worker() {
 	defer wg2.Done()
-
-	buf := make([]byte, 4096)
 
 	for {
 		f, ok := <-q2
@@ -215,14 +287,14 @@ func q2_worker() {
 				return err
 			}
 			defer fh.Close()
-			n, err := fh.Read(buf)
+			n, err := io.Copy(h, fh)
 			if err != nil {
 				return err
 			}
-			if n < len(buf) {
+			if n < int64(f.size) {
 				return fmt.Errorf("short read on " + f.path)
 			}
-			h.Write(buf)
+			atomic.AddInt64(&stat_bytes_done, int64(n))
 			s := fmt.Sprintf("%x", h.Sum(nil))
 
 			q3_mu.Lock()
@@ -254,9 +326,52 @@ func q3_worker() {
 			return
 		}
 
-		fmt.Println("==", f.path, f.partner, "...")
+		if verbose {
+			if filepath.Base(f.path) == filepath.Base(f.partner) {
+				fmt.Println("==", filepath.Base(f.path))
+			} else {
+				fmt.Println("!!")
+			}
+			fmt.Println("\t" + f.path)
+			fmt.Println("\t" + f.partner)
+		}
+
+		if dry {
+			atomic.AddInt64(&stat_files_saved, 1)
+			atomic.AddInt64(&stat_bytes_saved, int64(f.size))
+			continue
+		}
 
 		err := func() error {
+			q4_mu.Lock()
+			defer q4_mu.Unlock()
+
+			defer atomic.AddInt64(&stat_files_saved, 1)
+			defer atomic.AddInt64(&stat_bytes_saved, int64(f.size))
+
+			// sanity check
+			if sanity {
+				o1, err := exec.Command("md5sum", f.path).Output()
+				if err != nil {
+					log.Println(err)
+					os.Exit(1)
+				}
+				o2, err := exec.Command("md5sum", f.partner).Output()
+				if err != nil {
+					log.Println(err)
+					os.Exit(1)
+				}
+				if len(o1) < 32 || len(o2) < 32 || string(o1[:32]) != string(o2[:32]) || len(o1) < 32 {
+					log.Println("EEEEEK")
+					log.Println(string(o1))
+					log.Println(string(o2))
+					os.Exit(1)
+				}
+				if verbose {
+					fmt.Println("\t" + string(o1[:32]))
+				}
+			}
+
 			tmp := f.path + "_DERP"
 			cmd := exec.Command("cp", "-n", "-p", "--reflink=always", f.partner, tmp)
 			cmd.Stdout = os.Stdout
@@ -279,4 +394,22 @@ func q3_worker() {
 			log.Println(err)
 		}
 	}
+}
+
+func fmt_size(i int64) string {
+	v := float64(i)
+	unit := "bytes"
+	if v > 1024 {
+		unit = "k"
+		v /= 1024
+	}
+	if v > 1024 {
+		unit = "m"
+		v /= 1024
+	}
+	if v > 1024 {
+		unit = "g"
+		v /= 1024
+	}
+	return fmt.Sprintf("%.02f%s", v, unit)
 }
