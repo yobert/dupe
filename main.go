@@ -1,228 +1,282 @@
 package main
 
 import (
+	"crypto/md5"
+	"crypto/sha512"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	//	"os/exec"
-	"crypto/md5"
-	"crypto/sha256"
-	"github.com/cheggaaa/pb"
+	"os/exec"
 	"path/filepath"
+	"sync"
 )
 
-type keyType struct {
-	//Base string
-	Size int
+type File struct {
+	path    string
+	size    int
+	partner string
+	sent    bool
 }
-type indexType map[keyType][]string
 
-var index indexType
+const (
+	q1_workers = 1
+	q2_workers = 1
+	q3_workers = 1
+)
 
-func Bar(i int) *pb.ProgressBar {
-	b := pb.New(i)
-	b.Format("[=>-]")
-	b.Start()
-	return b
-}
+var (
+	wg1 sync.WaitGroup
+	wg2 sync.WaitGroup
+	wg3 sync.WaitGroup
+
+	q1      chan File
+	q1_idx  map[int]File
+	q1_dups map[string]struct{}
+
+	q2     chan File
+	q2_mu  sync.Mutex
+	q2_idx map[string]File
+
+	q3     chan File
+	q3_mu  sync.Mutex
+	q3_idx map[string]File
+
+	q4_mu sync.Mutex
+)
 
 func main() {
-	index = make(indexType, 1000000)
 
-	if len(os.Args) == 1 {
-		fmt.Println("pass me file paths to search")
-		os.Exit(1)
-		return
+	q1 = make(chan File)
+	q1_idx = make(map[int]File)
+	q1_dups = make(map[string]struct{})
+
+	q2 = make(chan File)
+	q2_idx = make(map[string]File)
+
+	q3 = make(chan File)
+	q3_idx = make(map[string]File)
+
+	for i := 0; i < q1_workers; i++ {
+		wg1.Add(1)
+		go q1_worker()
 	}
 
-	log.Println("searching...")
+	for i := 0; i < q2_workers; i++ {
+		wg2.Add(1)
+		go q2_worker()
+	}
 
-	c_all := 0
-	c_pot := 0
+	for i := 0; i < q3_workers; i++ {
+		wg3.Add(1)
+		go q3_worker()
+	}
 
-	b := Bar(len(os.Args) - 1)
-
-	for i, p := range os.Args {
-		if i == 0 {
-			continue
-		}
-		b.Increment()
-
-		filepath.Walk(p, func(path string, info os.FileInfo, err error) error {
+	for _, p := range os.Args[1:] {
+		err := Walk(p, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				log.Println(err)
-				return nil
+				return err
 			}
-			if info.IsDir() {
-				return nil
-			}
-			if info.Size() < 1024*1024 {
+
+			s := int(info.Size())
+
+			if s < 1024*1024 {
 				return nil
 			}
 			if info.Mode()&os.ModeSymlink > 0 {
 				return nil
 			}
-			c_all++
-			key := keyType{
-				//Base: info.Name(),
-				Size: int(info.Size()),
+
+			path, err = filepath.Abs(filepath.Clean(path))
+			if err != nil {
+				return err
 			}
-			v := index[key]
-			if len(v) > 0 {
-				c_pot++
+
+			// skip exact path duplicates (in case you pass two folders as arguments, and one contains the other, etc)
+			_, pathdup := q1_dups[path]
+			if pathdup {
+				log.Println("skipping duplicated path entry: " + path)
+				return nil
 			}
-			v = append(v, path)
-			index[key] = v
+			q1_dups[path] = struct{}{}
+
+			f := File{
+				path: path,
+				size: s,
+			}
+
+			first, ok := q1_idx[s]
+
+			if ok {
+				if !first.sent {
+					q1 <- first
+					first.sent = true
+					q1_idx[s] = first
+				}
+				q1 <- f
+			} else {
+				q1_idx[s] = f
+			}
 			return nil
 		})
-	}
-	b.Finish()
-
-	real_count := 0
-	real_total := 0
-	real_bytes := 0
-	for k, v := range index {
-		if len(v) > 1 {
-			real_count++
-			real_total += len(v)
-			real_bytes += k.Size
+		if err != nil {
+			log.Fatal(err)
 		}
 	}
 
-	if real_count == 0 {
-		fmt.Println("nothin to dedupe.")
-		os.Exit(1)
-		return
-	}
+	close(q1)
+	wg1.Wait()
 
-	b = Bar(real_count)
+	//fmt.Println("q1 done")
+
+	close(q2)
+	wg2.Wait()
+
+	//fmt.Println("q2 done")
+
+	close(q3)
+	wg3.Wait()
+
+	//fmt.Println("q3 done")
+}
+
+func q1_worker() {
+	defer wg1.Done()
 
 	buf := make([]byte, 4096)
 
-	total_savings := 0
-
-	for k, v := range index {
-		siz := k.Size
-
-		if len(v) == 0 {
-			log.Fatal("wtf")
+	for {
+		f, ok := <-q1
+		if !ok {
+			return
 		}
-		if len(v) == 1 {
-			continue
-		}
-		b.Increment()
 
-		pre := make(map[string][]string, len(v))
+		//fmt.Println("q1", f.path)
+		f.sent = false
 
-		for _, f := range v {
+		err := func() error {
 			h := md5.New()
-			fh, err := os.Open(f)
+			fh, err := os.Open(f.path)
 			if err != nil {
-				log.Println(err)
-				continue
+				return err
 			}
+			defer fh.Close()
 			n, err := fh.Read(buf)
-			fh.Close()
-			if n < len(buf) {
-				log.Println("short read on " + f)
-				continue
-			}
 			if err != nil {
-				log.Println(err)
-				continue
+				return err
+			}
+			if n < len(buf) {
+				return fmt.Errorf("short read on " + f.path)
 			}
 			h.Write(buf)
 			s := fmt.Sprintf("%x", h.Sum(nil))
-			pre[s] = append(pre[s], f)
-		}
 
-		c := 0
-		for _, v := range pre {
-			if len(v) > 1 {
-				c++
-			}
-		}
-		if c == 0 {
-			continue
-		}
+			q2_mu.Lock()
+			defer q2_mu.Unlock()
 
-		final := make(map[string][]string, c)
+			first, ok := q2_idx[s]
 
-		for _, v := range pre {
-			if len(v) == 0 {
-				log.Fatal("wtf")
-			}
-			if len(v) == 1 {
-				continue
-			}
-
-			for _, f := range v {
-				h := sha256.New()
-				fh, err := os.Open(f)
-				if err != nil {
-					log.Println(err)
-					continue
+			if ok {
+				if !first.sent {
+					q2 <- first
+					first.sent = true
+					q2_idx[s] = first
 				}
-				if _, err := io.Copy(h, fh); err != nil {
-					log.Println(err)
-					fh.Close()
-					continue
-				}
-				fh.Close()
-
-				s := fmt.Sprintf("%x", h.Sum(nil))
-				final[s] = append(final[s], f)
+				q2 <- f
+			} else {
+				q2_idx[s] = f
 			}
+			return nil
+		}()
+
+		if err != nil {
+			log.Println(err)
 		}
-
-		for _, v := range final {
-			if len(v) == 0 {
-				log.Fatal("wtf")
-			}
-			if len(v) == 1 {
-				continue
-			}
-			//			fmt.Printf("%s\n", k)
-			for _, _ = range v {
-				//				fmt.Printf("\t%s\n", f)
-
-				total_savings += siz
-			}
-		}
-
-		/*		//args := []string{"-ahl"}
-				args := []string{"-d"}
-				args = append(args, v...)
-
-				//cmd := exec.Command("ls", args...)
-				cmd := exec.Command("duperemove", args...)
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stdout
-				err := cmd.Run()
-				if err != nil {
-					log.Println(err)
-				}*/
 	}
-	b.Finish()
-
-	fmt.Println("total savings:", fmt_size(total_savings))
 }
 
-func fmt_size(i int) string {
-	v := float64(i)
-	unit := "bytes"
-	if v > 1024 {
-		unit = "KB"
-		v /= 1024
+func q2_worker() {
+	defer wg2.Done()
+
+	buf := make([]byte, 4096)
+
+	for {
+		f, ok := <-q2
+		if !ok {
+			return
+		}
+
+		//fmt.Println("q2", f.path)
+		f.sent = false
+
+		err := func() error {
+			h := sha512.New()
+			fh, err := os.Open(f.path)
+			if err != nil {
+				return err
+			}
+			defer fh.Close()
+			n, err := fh.Read(buf)
+			if err != nil {
+				return err
+			}
+			if n < len(buf) {
+				return fmt.Errorf("short read on " + f.path)
+			}
+			h.Write(buf)
+			s := fmt.Sprintf("%x", h.Sum(nil))
+
+			q3_mu.Lock()
+			defer q3_mu.Unlock()
+
+			first, ok := q3_idx[s]
+
+			if ok {
+				f.partner = first.path
+				q3 <- f
+			} else {
+				q3_idx[s] = f
+			}
+			return nil
+		}()
+
+		if err != nil {
+			log.Println(err)
+		}
 	}
-	if v > 1024 {
-		unit = "MB"
-		v /= 1024
+}
+
+func q3_worker() {
+	defer wg3.Done()
+
+	for {
+		f, ok := <-q3
+		if !ok {
+			return
+		}
+
+		fmt.Println("==", f.path, f.partner, "...")
+
+		err := func() error {
+			tmp := f.path + "_DERP"
+			cmd := exec.Command("cp", "-n", "-p", "--reflink=always", f.partner, tmp)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+
+			err := cmd.Run()
+			if err != nil {
+				return err
+			}
+
+			err = os.Rename(tmp, f.path)
+			if err != nil {
+				return err
+			}
+
+			fmt.Println("==", f.path, f.partner, "complete")
+			return nil
+		}()
+		if err != nil {
+			log.Println(err)
+		}
 	}
-	if v > 1024 {
-		unit = "GB"
-		v /= 1024
-	}
-	return fmt.Sprintf("%.02f %s", v, unit)
 }
